@@ -4,6 +4,7 @@
 
 - **ZERO framework dependencies**. No ZIO, no JSON, no HTTP, no database libraries.
 - Pure Scala + JDK only (`java.time`, `java.util.UUID`, etc.).
+- The domain knows nothing about `Effect`, `F[_]`, or tagless final. It is pure.
 
 ## Patterns
 
@@ -37,6 +38,19 @@ Use the shared `DomainError` enum:
 - `ValidationError(message)` — input validation failures
 - `TodoNotFound(id)` — repository miss
 - `InvalidStateTransition(message)` — business rule violation
+
+### Interaction with Application Layer
+
+The application layer lifts domain `Either` results into its abstract effect `F[_]` via `Effect.fromEither(...)`:
+
+```scala
+for
+  title <- Effect.fromEither(Title.create(command.title))
+  ...
+yield ...
+```
+
+The domain itself remains completely unaware of this.
 
 ### Testing
 

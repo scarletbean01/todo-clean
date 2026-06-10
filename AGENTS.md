@@ -1,15 +1,16 @@
-# Project: untitled1 — Todo Manager (Clean Architecture + ZIO)
+# Project: untitled1 — Todo Manager (Clean Architecture + Tagless Final + ZIO)
 
 ## Overview
 
 This is a demo project implementing a Todo Manager REST API using:
 - **Scala 3.8.4**
-- **ZIO 2.1** (effect system and runtime)
+- **Tagless Final** (`F[_]` abstraction via a lightweight custom `Effect` typeclass)
+- **ZIO 2.1** (concrete effect runtime)
 - **ZIO HTTP 3.0** (web server)
 - **ZIO JSON** (JSON serialization)
 - **Strict Clean Architecture** (aka Hexagonal Architecture)
 
-The architecture follows the Dependency Rule: domain code has zero framework dependencies. Dependencies point inward.
+The architecture follows the Dependency Rule: domain code has zero framework dependencies. Dependencies point inward. The application layer is **polymorphic** in `F[_]` via a lightweight custom `Effect` typeclass, allowing the core to be tested synchronously with `Either` while adapters run on ZIO.
 
 ## Build & Run
 
@@ -42,16 +43,28 @@ Server starts on default port (8080).
 3. **Narrow Ports**: Apply ISP. One method per port when possible.
 4. **Dedicated DTOs**: Each use case has its own input command and output model.
 5. **Full Mapping**: Web DTOs → Application DTOs → Domain Entities.
-6. **Effect Boundary**: Domain and use cases return `Either[DomainError, A]`. Adapters lift into ZIO.
+6. **Effect Boundary**:
+   - **Domain** returns `Either[DomainError, A]` — pure, no effects.
+   - **Application** is polymorphic in `F[_]`: ports and services return `F[A]`.
+   - **Adapter** provides the concrete `Effect[F]` instance (ZIO) and lifts `Either` into `F`.
+   - **Bootstrap** wires the concrete effect type (`TaskE = ZIO[Any, DomainError, *]`).
 
 ## Layer Conventions
 
 See `AGENTS.md` files in each layer directory for specific conventions.
 
-## ZLayer Dependency Injection
+## Tagless Final + ZLayer
 
-The bootstrap layer uses **ZLayer** for dependency injection. Each adapter and application service exposes a `live` ZLayer factory in its companion object. This keeps wiring declarative and composable while preserving the clean architecture boundary — domain and application service logic remain pure (`Either`-based), and only construction is lifted into ZIO.
+The application layer uses a **custom `Effect[F[_]]` typeclass** (no Cats dependency) to abstract over effect systems:
 
-## Why No Tagless Final
+```scala
+trait Effect[F[_]]:
+  def pure[A](a: A): F[A]
+  def fromEither[A](ea: Either[DomainError, A]): F[A]
+  def raiseError[A](e: DomainError): F[A]
+  ...
+```
 
-Tagless final (`F[_]`) is designed to abstract over *effect systems*. Clean Architecture's ports already abstract over *infrastructure* (DB, HTTP, external APIs). Since this project commits to ZIO as its runtime, adding tagless final would create redundant abstraction without value. The domain is already decoupled from ZIO through the port/adapter pattern.
+Domain results are lifted via `Effect.fromEither(...)` inside `for` comprehensions. The adapter layer provides a `given Effect[TaskE]` for ZIO. Tests provide a `given Effect[Either[DomainError, *]]` for synchronous, deterministic execution.
+
+ZLayer is used in the **adapter** and **bootstrap** layers only. Application services are plain polymorphic classes; concrete construction happens in bootstrap.
