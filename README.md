@@ -1,8 +1,8 @@
-# Todo Manager — Clean Architecture with ZIO
+# Todo Manager — Clean Architecture + Tagless Final with ZIO
 
-A demo REST API for managing todos, built with **Scala 3**, **ZIO**, and **ZIO HTTP** following **Clean Architecture** (aka Hexagonal Architecture) principles.
+A demo REST API for managing todos, built with **Scala 3**, **ZIO**, and **ZIO HTTP** following **Clean Architecture** (Hexagonal Architecture) principles, enhanced with a lightweight **Tagless Final** abstraction via a custom `Effect[F[_]]` typeclass.
 
-The domain layer has **zero framework dependencies**. All business logic is expressed in pure Scala, tested in isolation, and protected from infrastructure concerns by ports and adapters.
+The domain layer has **zero framework dependencies**. The application layer is **polymorphic in `F[_]`**, allowing the core to be tested synchronously with `Either` while adapters run on ZIO.
 
 ---
 
@@ -71,7 +71,7 @@ Content-Type: application/json
 }
 ```
 
-**Response 400 Bad Request** (empty title, title too long, or description too long)
+**Response 400 Bad Request** — empty title, title too long, or description too long.
 
 ---
 
@@ -113,20 +113,68 @@ GET /todos
 
 ## Architecture
 
-This project follows **Clean Architecture** / **Hexagonal Architecture**.
+This project combines **Clean Architecture** (ports and adapters) with a lightweight **Tagless Final** abstraction.
 
 ### Dependency Rule
 
-Dependencies point **inward**. The domain knows nothing about ZIO, HTTP, JSON, or databases.
+Dependencies point **inward**. The domain knows nothing about ZIO, HTTP, JSON, or databases. The application layer is polymorphic in `F[_]` — it knows about effects abstractly, but not about ZIO concretely.
 
 ```
-┌─────────────────────────────────────┐
-│  Web Adapter (ZIO HTTP + JSON)      │  ← Frameworks
-├─────────────────────────────────────┤
-│  Use Cases + Ports                  │  ← Application
-├─────────────────────────────────────┤
-│  Domain (Entities + Value Objects)  │  ← Pure business logic
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│  Bootstrap (ZLayer wiring, commits to TaskE) │
+├─────────────────────────────────────────────┤
+│  Adapter (ZIO HTTP, ZIO JSON, TaskE alias)   │
+│  → provides given Effect[TaskE]              │
+├─────────────────────────────────────────────┤
+│  Application (polymorphic in F[_])           │
+│  → Effect[F[_]] typeclass                    │
+│  → ports: SaveTodoPort[F], LoadTodoPort[F]   │
+│  → services: CreateTodoService[F]            │
+├─────────────────────────────────────────────┤
+│  Domain (pure, zero deps, returns Either)    │
+│  → Title.create: Either[ValidationError, _]  │
+│  → Todo.complete: Either[InvalidState, _]    │
+└─────────────────────────────────────────────┘
+```
+
+### The `Effect[F[_]]` Typeclass
+
+A minimal abstraction over effect systems (no Cats dependency):
+
+```scala
+trait Effect[F[_]]:
+  def pure[A](a: A): F[A]
+  def map[A, B](fa: F[A])(f: A => B): F[B]
+  def flatMap[A, B](fa: F[A])(f: A => F[B]): F[B]
+  def fromEither[A](ea: Either[DomainError, A]): F[A]
+  def raiseError[A](e: DomainError): F[A]
+```
+
+The application layer uses `Effect.fromEither(...)` to lift pure domain results into the abstract effect:
+
+```scala
+class CreateTodoService[F[_]: Effect](savePort: SaveTodoPort[F]) extends CreateTodoUseCase[F]:
+  def create(command: CreateTodoCommand): F[TodoResponse] =
+    for
+      title       <- Effect.fromEither(Title.create(command.title))
+      description <- Effect.fromEither(Description.create(...))
+      todo = Todo(...)
+      _           <- savePort.save(todo)
+    yield TodoResponse.fromDomain(todo)
+```
+
+### Concrete Effect: `TaskE`
+
+The adapter layer defines the concrete effect and its `Effect` instance:
+
+```scala
+type TaskE[A] = ZIO[Any, DomainError, A]
+
+given Effect[TaskE] with
+  def pure[A](a: A)           = ZIO.succeed(a)
+  def fromEither[A](ea)       = ZIO.fromEither(ea)
+  def raiseError[A](e)        = ZIO.fail(e)
+  ...
 ```
 
 ### Layer Breakdown
@@ -141,38 +189,50 @@ Pure Scala. No imports from `zio.*`, `zio.http.*`, or any framework.
 
 #### Application (`todo/application/`)
 
-Orchestrates domain logic. Still no framework dependencies.
+Orchestrates domain logic. Polymorphic in `F[_]` via `Effect`. No ZIO, HTTP, or JSON.
 
-- **Incoming Ports** (`port/in/`): `CreateTodoUseCase`, `CompleteTodoUseCase`, `GetTodoUseCase`, `ListTodosUseCase`
-- **Outgoing Ports** (`port/out/`): `SaveTodoPort`, `LoadTodoPort`, `FindTodosPort` — narrow, single-method interfaces.
-- **Services** (`service/`): Implement incoming ports, returning `Either[DomainError, A]`.
+- **Effect** (`Effect.scala`): The `Effect[F[_]]` typeclass and syntax.
+- **Incoming Ports** (`port/in/`): `CreateTodoUseCase[F]`, `CompleteTodoUseCase[F]`, etc.
+- **Outgoing Ports** (`port/out/`): `SaveTodoPort[F]`, `LoadTodoPort[F]`, `FindTodosPort[F]` — narrow, ISP-compliant.
+- **Services** (`service/`): Implement incoming ports, returning `F[A]`.
 - **DTOs** (`dto/`): Dedicated command/response models per use case.
 
 #### Adapter (`todo/adapter/`)
 
-Bridges the application to the outside world.
+Bridges the application to the outside world. Provides the concrete `Effect[TaskE]`.
 
-- **Web Adapter** (`adapter/in/web/`): ZIO HTTP routes. Parses JSON, maps to commands, calls use cases, maps errors to HTTP status codes.
-- **Persistence Adapter** (`adapter/out/persistence/`): In-memory `ConcurrentHashMap` implementation of the outgoing ports. Swappable for a real database adapter (e.g., Doobie) without touching domain or application code.
+- **Web Adapter** (`adapter/in/web/`): ZIO HTTP routes. Parses JSON, maps to commands, calls use cases, handles errors via ZIO's `catchAll`.
+- **Persistence Adapter** (`adapter/out/persistence/`): In-memory `ConcurrentHashMap` implementation. Exposes a `ZLayer` factory for wiring.
 
 #### Bootstrap (`todo/bootstrap/`)
 
-Wires everything together manually:
+Wires everything together via **ZLayer composition**:
 
 ```scala
-val repository = new InMemoryTodoRepository()
-val createService = new CreateTodoService(repository)
-val routes = TodoRoutes(createService, ...)
-Server.serve(routes).provide(Server.default)
+object AppLayer:
+  val live: ZLayer[Any, Nothing, Routes[Any, Response]] =
+    InMemoryTodoRepository.live >+>
+      ZLayer.fromFunction((save: SaveTodoPort[TaskE]) =>
+        new CreateTodoService[TaskE](save)
+      ) >+>
+      ... >+>
+      TodoRoutes.live
 ```
 
 ---
 
-## Why Not Tagless Final?
+## Why Tagless Final Here?
 
-Tagless final (`F[_]`) abstracts over **effect systems** (e.g., ZIO vs. Cats Effect). Clean Architecture's **ports and adapters** already abstract over **infrastructure** (e.g., in-memory vs. Postgres, HTTP vs. CLI).
+Clean Architecture's ports abstract over **infrastructure** (DB, HTTP). Tagless final (`Effect[F[_]]`) abstracts over **effect systems** (ZIO, Cats Effect, or synchronous `Either`).
 
-Since this project commits to ZIO as its runtime, adding tagless final would introduce indirection without value. The domain is fully decoupled from ZIO through ports — if you ever needed to migrate from ZIO to Cats Effect, only the `adapter.in.web` and `bootstrap` packages would change.
+By combining both:
+
+1. **Domain stays pure** — business logic is `Either`-based, testable with plain assertions.
+2. **Application is effect-agnostic** — use cases work with any `F[_]` that has an `Effect` instance.
+3. **Adapters commit to ZIO** — the web server and repository run on `TaskE`.
+4. **Tests run synchronously** — provide `Effect[Either[DomainError, *]]` and test use cases without a ZIO runtime.
+
+To swap the effect runtime (e.g., ZIO → Cats Effect): provide a new `Effect[IO]` instance and update the bootstrap. Domain and application services remain unchanged.
 
 ---
 
@@ -180,9 +240,23 @@ Since this project commits to ZIO as its runtime, adding tagless final would int
 
 | Layer | Test Type | Approach |
 |-------|-----------|----------|
-| Domain | Unit | Plain Scala assertions. No mocking. |
-| Use Cases | Unit | Mock outgoing ports with simple fakes. Verify orchestration and error handling. |
+| Domain | Unit | Plain Scala assertions. No mocking. No ZIO runtime. |
+| Use Cases | Unit | Provide `Effect[Either[DomainError, *]]`. Mock ports with simple fakes. Tests run synchronously. |
 | Adapters | Integration | (Not included in demo) Test against real ZIO HTTP / Testcontainers. |
+
+Example — testing use cases without ZIO:
+
+```scala
+type IdEither[A] = Either[DomainError, A]
+
+given Effect[IdEither] with
+  def pure[A](a: A) = Right(a)
+  def fromEither[A](ea) = ea
+  ...
+
+val service = new CreateTodoService[IdEither](fakePort)
+val result = service.create(command) // Just Either!
+```
 
 Run tests:
 
@@ -211,6 +285,7 @@ sbt test
     │   │   └── Status.scala
     │   ├── application/
     │   │   ├── AGENTS.md              # Application layer conventions
+    │   │   ├── Effect.scala           # Effect[F[_]] typeclass
     │   │   ├── port/
     │   │   │   ├── in/                # Incoming ports (use cases)
     │   │   │   └── out/               # Outgoing ports (repository interfaces)
@@ -218,14 +293,16 @@ sbt test
     │   │   └── service/               # Use case implementations
     │   ├── adapter/
     │   │   ├── AGENTS.md              # Adapter layer conventions
+    │   │   ├── TaskE.scala            # Concrete TaskE = ZIO alias + instance
     │   │   ├── in/web/                # ZIO HTTP routes, JSON DTOs
-    │   │   └── out/persistence/       # In-memory repository
+    │   │   └── out/persistence/       # In-memory repository (ZLayer)
     │   └── bootstrap/
     │       ├── AGENTS.md              # Bootstrap/wiring conventions
+    │       ├── AppLayer.scala         # ZLayer composition
     │       └── MainApp.scala          # Entry point
     └── test/scala/org/deplague/todo/
         ├── domain/                    # Domain unit tests
-        └── application/service/       # Use case unit tests
+        └── application/service/       # Use case unit tests (Either-based)
 ```
 
 ---
